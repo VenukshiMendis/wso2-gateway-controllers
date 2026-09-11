@@ -34,6 +34,11 @@ const (
 	metadataMcpAction         = "mcp.action"
 	mcpSessionHeader          = "mcp-session-id"
 	defaultAclMode            = "deny"
+
+	reasonSyntaxError       = "syntax-error"
+	reasonInvalidMemberType = "invalid-member-type"
+	reasonNotAnObject       = "not-an-object"
+	reasonAmbiguous         = "ambiguous"
 )
 
 type AclConfig struct {
@@ -46,6 +51,10 @@ type McpAclListPolicy struct {
 	tools     AclConfig
 	resources AclConfig
 	prompts   AclConfig
+
+	// BodyResolved says this route has an MCP operation resolver; the controller injects it.
+	// Undeclared in policy-definition.yaml on purpose, so an operator cannot set it by hand.
+	BodyResolved bool
 }
 
 type sseEvent struct {
@@ -83,6 +92,7 @@ func GetPolicy(
 	ins.tools = toolsConfig
 	ins.resources = resourcesConfig
 	ins.prompts = promptsConfig
+	ins.BodyResolved = getBoolParam(params, "bodyResolved", false)
 
 	slog.Debug("MCP ACL List Policy: Parsed configuration",
 		"toolsEnabled", ins.tools.Enabled,
@@ -99,10 +109,23 @@ func GetPolicy(
 	return ins, nil
 }
 
+func getBoolParam(params map[string]any, key string, defaultValue bool) bool {
+	if v, ok := params[key]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return defaultValue
+}
+
 func (p *McpAclListPolicy) Mode() policy.ProcessingMode {
+	requestHeader, requestBody := policy.HeaderModeSkip, policy.BodyModeBuffer
+	if p.BodyResolved {
+		requestHeader, requestBody = policy.HeaderModeProcess, policy.BodyModeSkip
+	}
 	return policy.ProcessingMode{
-		RequestHeaderMode:  policy.HeaderModeSkip,
-		RequestBodyMode:    policy.BodyModeBuffer,
+		RequestHeaderMode:  requestHeader,
+		RequestBodyMode:    requestBody,
 		ResponseHeaderMode: policy.HeaderModeSkip,
 		ResponseBodyMode:   policy.BodyModeBuffer,
 	}
@@ -368,16 +391,69 @@ func isMcpPostRequest(method, path string) bool {
 	return cleanPath == mcpPathSegment || strings.HasPrefix(cleanPath, mcpPathSegment+"/")
 }
 
+// OnRequestHeaders enforces the ACL where a resolver supplies the capability without a body.
+func (p *McpAclListPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.RequestHeaderContext, _ map[string]any) policy.RequestHeaderAction {
+	ds := reqCtx.DownstreamRequest()
+	routePath := ds.Path
+	if reqCtx.SharedContext != nil {
+		routePath = reqCtx.OperationPath
+	}
+	if !isMcpPostRequest(ds.Method, routePath) {
+		return nil
+	}
+
+	if !p.BodyResolved {
+		return nil
+	}
+
+	if reqCtx.SharedContext == nil {
+		reqCtx.SharedContext = &policy.SharedContext{}
+	}
+
+	// Gateway and server may read these bytes differently; this policy has no ambiguity
+	// check of its own, so the ACL would apply to the wrong operation.
+	if reason := unusableBodyReason(reqCtx.SharedContext); reason != "" {
+		slog.Debug("MCP ACL List Policy: Rejecting request whose body the resolver could not read", "reason", reason)
+		return p.handleUnusableBody(reqCtx.Headers, reason)
+	}
+
+	facts := mcpFacts(reqCtx.Headers, reqCtx.SharedContext)
+
+	if !facts.IsRequestBodyPresent || (facts.IsModernRequest && !facts.HasMethod()) {
+		slog.Debug("MCP ACL List Policy: Skipping ACL enforcement because the request body or required Mcp-Method header is unavailable")
+		return nil
+	}
+
+	nameFor := func(string) (string, bool) { return facts.Name, true }
+
+	if resp := p.govern(reqCtx.SharedContext, reqCtx.Headers, facts.Method, facts.RequestID, nameFor); resp != nil {
+		return *resp
+	}
+	return nil
+}
+
 // OnRequestBody enforces ACL rules on the MCP request body.
 func (p *McpAclListPolicy) OnRequestBody(ctx context.Context, reqCtx *policy.RequestContext, _ map[string]any) policy.RequestAction {
+	if p.BodyResolved {
+		return policy.UpstreamRequestModifications{}
+	}
+
 	ds := reqCtx.DownstreamRequest()
-	if !isMcpPostRequest(ds.Method, reqCtx.OperationPath) {
+	routePath := ds.Path
+	if reqCtx.SharedContext != nil {
+		routePath = reqCtx.OperationPath
+	}
+	if !isMcpPostRequest(ds.Method, routePath) {
 		return policy.UpstreamRequestModifications{}
 	}
 	slog.Debug("MCP ACL List Policy: OnRequest started")
 
 	if reqCtx.Body == nil || len(reqCtx.Body.Content) == 0 {
 		return policy.UpstreamRequestModifications{}
+	}
+
+	if reqCtx.SharedContext == nil {
+		reqCtx.SharedContext = &policy.SharedContext{}
 	}
 
 	// Read Content-Type and the session id (used for error responses) from the
@@ -387,62 +463,91 @@ func (p *McpAclListPolicy) OnRequestBody(ctx context.Context, reqCtx *policy.Req
 	requestPayload, _, _, err := parseRequestPayload(reqCtx.Body.Content, isEventStream(ds.Headers))
 	if err != nil {
 		slog.Debug("MCP ACL List Policy: Failed to parse MCP request", "error", err, "path", ds.Path)
-		return p.buildRequestErrorResponse(ds.Headers, 400, -32700, "Invalid JSON", nil)
+		return p.handleUnusableBody(ds.Headers, reasonSyntaxError)
 	}
 
 	requestID := requestPayload["id"]
-
 	method, _ := requestPayload["method"].(string)
+
+	// false lets govern report a bad params in the released order, after the group is
+	// known — reporting sooner turns an unconfigured family into a 400.
+	nameFor := func(capabilityType string) (string, bool) {
+		paramsRaw, ok := requestPayload["params"].(map[string]any)
+		if !ok {
+			return "", false
+		}
+		name, _ := paramsRaw[getParamKey(capabilityType)].(string)
+		return name, true
+	}
+
+	if resp := p.govern(reqCtx.SharedContext, ds.Headers, method, requestID, nameFor); resp != nil {
+		return *resp
+	}
+	return policy.UpstreamRequestModifications{}
+}
+
+// govern is the ACL decision, shared by both request phases so the two cannot drift. nameFor
+// resolves the name once the family is known; false means params was not an object.
+func (p *McpAclListPolicy) govern(shared *policy.SharedContext, headers *policy.Headers,
+	method string, requestID any, nameFor func(capabilityType string) (string, bool)) *policy.ImmediateResponse {
+
 	capabilityType, action, ok := parseMcpMethod(method)
 	if !ok {
-		return policy.UpstreamRequestModifications{}
+		return nil
 	}
 
-	if reqCtx.Metadata == nil {
-		reqCtx.Metadata = make(map[string]any)
+	// The note OnResponseBody gates on, written before the checks below: a listing fails
+	// them and a listing is exactly what the response phase filters.
+	if shared.Metadata == nil {
+		shared.Metadata = make(map[string]any)
 	}
-	reqCtx.Metadata[metadataMcpCapabilityType] = capabilityType
-	reqCtx.Metadata[metadataMcpAction] = action
+	shared.Metadata[metadataMcpCapabilityType] = capabilityType
+	shared.Metadata[metadataMcpAction] = action
 
 	if !isApplicableOnRequest(capabilityType, action) {
-		return policy.UpstreamRequestModifications{}
+		return nil
 	}
 
 	config := p.getAclConfig(capabilityType)
 	if !config.Enabled {
-		return policy.UpstreamRequestModifications{}
+		return nil
 	}
 
-	paramsRaw, ok := requestPayload["params"].(map[string]any)
-	if !ok {
+	capabilityName, paramsReadable := nameFor(capabilityType)
+	if !paramsReadable {
 		slog.Debug("MCP ACL List Policy: Invalid request params", "capabilityType", capabilityType, "requestID", requestID, "error", "params not a map")
-		return p.buildRequestErrorResponse(ds.Headers, 400, -32602, "Invalid MCP request params", requestID)
+		resp := p.buildRequestErrorResponse(headers, 400, -32602, "Invalid MCP request params", requestID)
+		return &resp
 	}
 
-	paramKey := getParamKey(capabilityType)
-	capabilityName, _ := paramsRaw[paramKey].(string)
 	if strings.TrimSpace(capabilityName) == "" {
-		slog.Debug("MCP ACL List Policy: Missing capability name", "capabilityType", capabilityType, "requestID", requestID, "paramKey", paramKey)
-		return p.buildRequestErrorResponse(ds.Headers, 400, -32602, fmt.Sprintf("Missing MCP %s name", capabilityType), requestID)
+		slog.Debug("MCP ACL List Policy: Missing capability name", "capabilityType", capabilityType, "requestID", requestID)
+		resp := p.buildRequestErrorResponse(headers, 400, -32602, fmt.Sprintf("Missing MCP %s name", capabilityType), requestID)
+		return &resp
 	}
 
 	if !isAllowedByAcl(config, capabilityName) {
 		slog.Debug("MCP ACL List Policy: Capability denied by policy", "capabilityType", capabilityType, "capabilityName", capabilityName, "requestID", requestID)
-		return p.buildRequestErrorResponse(ds.Headers, 400, -32000, "MCP capability not allowed", requestID)
+		resp := p.buildRequestErrorResponse(headers, 400, -32000, "MCP capability not allowed", requestID)
+		return &resp
 	}
 
-	return policy.UpstreamRequestModifications{}
+	return nil
 }
 
 // OnResponseBody enforces ACL rules on the MCP response body.
 func (p *McpAclListPolicy) OnResponseBody(ctx context.Context, respCtx *policy.ResponseContext, _ map[string]any) policy.ResponseAction {
 	ds := respCtx.DownstreamRequest()
-	if !isMcpPostRequest(ds.Method, respCtx.OperationPath) {
+	routePath := ds.Path
+	if respCtx.SharedContext != nil {
+		routePath = respCtx.OperationPath
+	}
+	if !isMcpPostRequest(ds.Method, routePath) {
 		return nil
 	}
 	slog.Debug("MCP ACL List Policy: OnResponseBody started")
 
-	if respCtx.Metadata == nil {
+	if respCtx.SharedContext == nil || respCtx.Metadata == nil {
 		return nil
 	}
 
@@ -572,8 +677,25 @@ func getSessionID(headers *policy.Headers) string {
 	return ""
 }
 
+// handleUnusableBody renders a reason the body could not be read. Both paths call it.
+func (p *McpAclListPolicy) handleUnusableBody(headers *policy.Headers, reason string) policy.ImmediateResponse {
+	code, message := -32600, "Invalid MCP request"
+	switch reason {
+	case reasonSyntaxError:
+		code, message = -32700, "Invalid JSON"
+	case reasonInvalidMemberType:
+		message = "Request body has a member of the wrong type"
+	case reasonNotAnObject:
+		message = "Request body is not a single JSON-RPC request object"
+	case reasonAmbiguous:
+		// The one this policy cannot detect itself — its map[string]any is case-sensitive.
+		message = "Ambiguous MCP request: body names a member more than once"
+	}
+	return p.buildRequestErrorResponse(headers, 400, code, message, nil)
+}
+
 // buildRequestErrorResponse builds a v1alpha2 error response for a request.
-func (p *McpAclListPolicy) buildRequestErrorResponse(headers *policy.Headers, statusCode int, jsonRpcCode int, reason string, requestID any) policy.RequestAction {
+func (p *McpAclListPolicy) buildRequestErrorResponse(headers *policy.Headers, statusCode int, jsonRpcCode int, reason string, requestID any) policy.ImmediateResponse {
 	sessionID := getSessionID(headers)
 	if isEventStream(headers) {
 		return p.buildEventStreamErrorResponse(statusCode, jsonRpcCode, reason, requestID, sessionID)
@@ -582,7 +704,7 @@ func (p *McpAclListPolicy) buildRequestErrorResponse(headers *policy.Headers, st
 }
 
 // buildEventStreamErrorResponse builds a v1alpha2 SSE error response.
-func (p *McpAclListPolicy) buildEventStreamErrorResponse(statusCode int, jsonRpcCode int, reason string, requestID any, sessionID string) policy.RequestAction {
+func (p *McpAclListPolicy) buildEventStreamErrorResponse(statusCode int, jsonRpcCode int, reason string, requestID any, sessionID string) policy.ImmediateResponse {
 	responseBody := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      requestID,
@@ -623,7 +745,7 @@ func (p *McpAclListPolicy) buildEventStreamErrorResponse(statusCode int, jsonRpc
 }
 
 // buildErrorResponse builds a v1alpha2 JSON error response.
-func (p *McpAclListPolicy) buildErrorResponse(statusCode int, jsonRpcCode int, reason string, requestID any, sessionID string) policy.RequestAction {
+func (p *McpAclListPolicy) buildErrorResponse(statusCode int, jsonRpcCode int, reason string, requestID any, sessionID string) policy.ImmediateResponse {
 	responseBody := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      requestID,

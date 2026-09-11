@@ -53,7 +53,7 @@ All available policies, sorted alphabetically.
 | [LLM Cost Based Ratelimit](./llm-cost-based-ratelimit/v1.0/docs/llm-cost-based-ratelimit.md) | AI | A specialized rate limiting policy that enforces monetary budget limits on LLM API usage. |
 | [LLM Header Router](./llm-header-router/v0.9/docs/llm-header-router.md) | AI | Selects an LLM provider for OpenAI Chat Completions requests using a configurable request header. |
 | [Log Message](./log-message/v1.0/docs/log-message.md) | Logging, Analytics & Monitoring, MCP, WebSub, WebBroker | This policy provides the capability to log the payload and headers of a request/response. |
-| [MCP Access Control](./mcp-acl-list/v1.0/docs/mcp-acl-list.md) | MCP | MCP ACL List policy controls access to tools, resources, and prompts using mode and exceptions. |
+| [MCP Access Control](./mcp-acl-list/v1.1/docs/mcp-acl-list.md) | MCP | MCP ACL List policy controls access to tools, resources, and prompts using mode and exceptions. |
 | [MCP Authentication](./mcp-auth/v1.3/docs/mcp-authentication.md) | MCP, Security | This policy secures traffic to a Model Context Protocol server, with the gateway acting as the resource server and validating the access tokens presented in requests. |
 | [MCP Authorization](./mcp-authz/v1.2/docs/mcp-authorization.md) | MCP, Security | MCP Authorization governs which MCP capabilities an authenticated identity may invoke, matching scope and claim rules against the tool, resource, prompt or JSON-RPC method a request targets. |
 | [MCP Rate Limit](./mcp-ratelimit/v1.2/docs/mcp-ratelimit.md) | MCP, Security | Applies rate limits to MCP traffic per tool, resource, prompt, or JSON-RPC method. |
