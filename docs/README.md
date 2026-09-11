@@ -57,7 +57,7 @@ All available policies, sorted alphabetically.
 | [MCP Authentication](./mcp-auth/v1.3/docs/mcp-authentication.md) | MCP, Security | This policy secures traffic to a Model Context Protocol server, with the gateway acting as the resource server and validating the access tokens presented in requests. |
 | [MCP Authorization](./mcp-authz/v1.2/docs/mcp-authorization.md) | MCP, Security | MCP Authorization governs which MCP capabilities an authenticated identity may invoke, matching scope and claim rules against the tool, resource, prompt or JSON-RPC method a request targets. |
 | [MCP Rate Limit](./mcp-ratelimit/v1.2/docs/mcp-ratelimit.md) | MCP, Security | Applies rate limits to MCP traffic per tool, resource, prompt, or JSON-RPC method. |
-| [MCP Rewrite](./mcp-rewrite/v1.0/docs/mcp-rewrite.md) | MCP | MCP Rewrite policy defines user-facing tools, resources, and prompts and maps them to backend capability names using optional "target" fields. |
+| [MCP Rewrite](./mcp-rewrite/v1.1/docs/mcp-rewrite.md) | MCP | MCP Rewrite policy defines user-facing tools, resources, and prompts and maps them to backend capability names using optional "target" fields. |
 | [MCP Validation](./mcp-validation/v0.1/docs/mcp-validation.md) | MCP, Security | MCP Validation policy validates incoming MCP requests at the gateway: the request body on every request, and the mirrored HTTP headers on requests declaring MCP specification version 2026-07-28 or later. |
 | [Model Round Robin](./model-round-robin/v1.1/docs/model-round-robin.md) | AI | Implements round-robin load balancing for AI models. |
 | [Model Weighted Round Robin](./model-weighted-round-robin/v1.1/docs/model-weighted-round-robin.md) | AI | Implements weighted round-robin load balancing for AI models. |

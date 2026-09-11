@@ -687,3 +687,475 @@ func createMockResponseContext(requestHeaders, responseHeaders map[string][]stri
 		ResponseBody:    nil,
 	}
 }
+
+// rewriteToolA is the one config every mirrored-header test below uses: toolA rewrites to
+// backendTool, so a rewrite always changes the name and always makes the mirror stale.
+func rewriteToolA(t *testing.T) (policy.Policy, map[string]any) {
+	t.Helper()
+	params := map[string]any{
+		"tools": []any{
+			map[string]any{
+				"name":        "toolA",
+				"description": "desc",
+				"inputSchema": `{"type":"object"}`,
+				"target":      "backendTool",
+			},
+		},
+	}
+	return mustPolicy(t, params), params
+}
+
+// toolCallContext builds a tools/call on toolA carrying the given headers.
+func toolCallContext(t *testing.T, headers map[string][]string) *policy.RequestContext {
+	t.Helper()
+	ctx := createMockRequestContext(headers)
+	ctx.Method = "POST"
+	ctx.Path = "/mcp"
+	ctx.Body = &policy.Body{Content: mustJSON(t, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "1",
+		"method":  "tools/call",
+		"params":  map[string]any{"name": "toolA"},
+	}), Present: true}
+	return ctx
+}
+
+func mustModifications(t *testing.T, action policy.RequestAction) policy.UpstreamRequestModifications {
+	t.Helper()
+	mods, ok := action.(policy.UpstreamRequestModifications)
+	if !ok {
+		t.Fatalf("Expected UpstreamRequestModifications, got %T", action)
+	}
+	return mods
+}
+
+// TestOnRequest_RefusesToLaunderAMirrorMismatch is the most important assertion in this file.
+//
+// The header names a capability the caller is allowed and peer policies governed on; the body
+// names a different one. Rewriting the header to match the body would hand the backend a
+// self-consistent request invoking a capability authorization never saw, and the backend's
+// mandatory -32020 check would have nothing left to catch.
+func TestOnRequest_RefusesToLaunderAMirrorMismatch(t *testing.T) {
+	p, params := rewriteToolA(t)
+	ctx := toolCallContext(t, map[string][]string{
+		"mcp-protocol-version": {"2026-07-28"},
+		"mcp-method":           {"tools/call"},
+		"mcp-name":             {"query_database"},
+	})
+
+	action := p.(*McpRewritePolicy).OnRequestBody(context.Background(), ctx, params)
+
+	if mods, ok := action.(policy.UpstreamRequestModifications); ok {
+		t.Fatalf("Expected the request to be rejected, but it was forwarded with headers %v and body %s",
+			mods.HeadersToSet, string(mods.Body))
+	}
+	resp := mustImmediateResponse(t, action)
+	if resp.StatusCode != 400 {
+		t.Fatalf("Expected status 400, got %d", resp.StatusCode)
+	}
+	assertJSONRPCError(t, resp.Body, -32020, "Mcp-Name does not match the capability in the request body")
+}
+
+func TestOnRequest_RefusesAMethodMirrorMismatch(t *testing.T) {
+	p, params := rewriteToolA(t)
+	ctx := toolCallContext(t, map[string][]string{
+		"mcp-protocol-version": {"2026-07-28"},
+		"mcp-method":           {"tools/list"},
+		"mcp-name":             {"toolA"},
+	})
+
+	action := p.(*McpRewritePolicy).OnRequestBody(context.Background(), ctx, params)
+	if mods, ok := action.(policy.UpstreamRequestModifications); ok {
+		t.Fatalf("Expected the request to be rejected, but it was forwarded with headers %v and body %s",
+			mods.HeadersToSet, string(mods.Body))
+	}
+	resp := mustImmediateResponse(t, action)
+	if resp.StatusCode != 400 {
+		t.Fatalf("Expected status 400, got %d", resp.StatusCode)
+	}
+	assertJSONRPCError(t, resp.Body, -32020, "Mcp-Method does not match the method in the request body")
+}
+
+// A modern request must mirror its method: 2026-07-28 makes it mandatory, and a request that
+// mirrors nothing cannot be checked against the body at all.
+func TestOnRequest_RefusesAModernRequestThatMirrorsNoMethod(t *testing.T) {
+	p, params := rewriteToolA(t)
+	ctx := toolCallContext(t, map[string][]string{
+		"mcp-protocol-version": {"2026-07-28"},
+		"mcp-name":             {"toolA"},
+	})
+
+	resp := mustImmediateResponse(t, p.(*McpRewritePolicy).OnRequestBody(context.Background(), ctx, params))
+	if resp.StatusCode != 400 {
+		t.Fatalf("Expected status 400, got %d", resp.StatusCode)
+	}
+	assertJSONRPCError(t, resp.Body, -32020, "Mcp-Method header is required")
+}
+
+// The method check runs before the capability is resolved, so a contradictory request is refused
+// whatever it names. It is rejected rather than forwarded, so it cannot reach the backend by
+// skipping the unlisted-capability block below it.
+func TestOnRequest_MethodMismatchRefusedBeforeCapabilityLookup(t *testing.T) {
+	p, params := rewriteToolA(t)
+	ctx := createMockRequestContext(map[string][]string{
+		"mcp-protocol-version": {"2026-07-28"},
+		"mcp-method":           {"tools/list"},
+	})
+	ctx.Method = "POST"
+	ctx.Path = "/mcp"
+	ctx.Body = &policy.Body{Content: mustJSON(t, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "1",
+		"method":  "tools/call",
+		"params":  map[string]any{"name": "unlistedTool"},
+	}), Present: true}
+
+	resp := mustImmediateResponse(t, p.(*McpRewritePolicy).OnRequestBody(context.Background(), ctx, params))
+	assertJSONRPCError(t, resp.Body, -32020, "Mcp-Method does not match the method in the request body")
+}
+
+// A conformant modern listing must still publish the request-phase note the response phase gates
+// on, or */list results would stop being rewritten and leak backend capability names.
+func TestOnRequest_ModernListStillPublishesListMetadata(t *testing.T) {
+	p, params := rewriteToolA(t)
+	ctx := createMockRequestContext(map[string][]string{
+		"mcp-protocol-version": {"2026-07-28"},
+		"mcp-method":           {"tools/list"},
+	})
+	ctx.Method = "POST"
+	ctx.Path = "/mcp"
+	ctx.Body = &policy.Body{Content: mustJSON(t, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "1",
+		"method":  "tools/list",
+	}), Present: true}
+
+	p.(*McpRewritePolicy).OnRequestBody(context.Background(), ctx, params)
+
+	if got := ctx.Metadata[metadataMcpAction]; got != "list" {
+		t.Fatalf("Expected the list note to be published, got %v", got)
+	}
+	if got := ctx.Metadata[metadataMcpCapabilityType]; got != "tools" {
+		t.Fatalf("Expected capability type 'tools', got %v", got)
+	}
+}
+
+// An undecodable sentinel is not the same as an absent header: the client mirrored something,
+// and what a peer policy made of it cannot be established, so it is refused rather than
+// silently overwritten.
+func TestOnRequest_RefusesAnUndecodableMirroredName(t *testing.T) {
+	p, params := rewriteToolA(t)
+	ctx := toolCallContext(t, map[string][]string{
+		"mcp-protocol-version": {"2026-07-28"},
+		"mcp-method":           {"tools/call"},
+		"mcp-name":             {"=?base64?not valid base64!?="},
+	})
+
+	resp := mustImmediateResponse(t, p.(*McpRewritePolicy).OnRequestBody(context.Background(), ctx, params))
+	assertJSONRPCError(t, resp.Body, -32020, "Mcp-Name is not a decodable sentinel value")
+}
+
+func TestOnRequest_ModernRewriteRestatesTheMirroredName(t *testing.T) {
+	p, params := rewriteToolA(t)
+	ctx := toolCallContext(t, map[string][]string{
+		"mcp-protocol-version": {"2026-07-28"},
+		"mcp-method":           {"tools/call"},
+		"mcp-name":             {"toolA"},
+	})
+
+	mods := mustModifications(t, p.(*McpRewritePolicy).OnRequestBody(context.Background(), ctx, params))
+
+	updated := mustJSONMap(t, mods.Body)
+	if got := updated["params"].(map[string]any)["name"]; got != "backendTool" {
+		t.Fatalf("Expected rewritten body name 'backendTool', got %v", got)
+	}
+	if got := mods.HeadersToSet["Mcp-Name"]; got != "backendTool" {
+		t.Fatalf("Expected Mcp-Name rewritten to 'backendTool', got %q", got)
+	}
+}
+
+// By the time the name is checked the method is necessarily tools/call, resources/read or
+// prompts/get, and 2026-07-28 requires each of those to mirror the capability it targets. A
+// modern client that withholds Mcp-Name is refused rather than having one supplied for it.
+func TestOnRequest_RefusesAModernRequestThatMirrorsNoName(t *testing.T) {
+	p, params := rewriteToolA(t)
+	ctx := toolCallContext(t, map[string][]string{
+		"mcp-protocol-version": {"2026-07-28"},
+		"mcp-method":           {"tools/call"},
+	})
+
+	resp := mustImmediateResponse(t, p.(*McpRewritePolicy).OnRequestBody(context.Background(), ctx, params))
+	if resp.StatusCode != 400 {
+		t.Fatalf("Expected status 400, got %d", resp.StatusCode)
+	}
+	assertJSONRPCError(t, resp.Body, -32020, "Mcp-Name header is required for tools/call")
+}
+
+// The message names the method that required it, so a resources/read reads correctly too.
+func TestMirroredNameMismatch(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers map[string][]string
+		method  string
+		capName string
+		want    string
+	}{
+		{"legacy ignores the header entirely", map[string][]string{"mcp-name": {"other"}}, "tools/call", "toolA", ""},
+		{"modern agreeing", map[string][]string{"mcp-protocol-version": {"2026-07-28"}, "mcp-name": {"toolA"}}, "tools/call", "toolA", ""},
+		{"modern absent names the method", map[string][]string{"mcp-protocol-version": {"2026-07-28"}}, "resources/read", "file://a", "Mcp-Name header is required for resources/read"},
+		{"modern undecodable", map[string][]string{"mcp-protocol-version": {"2026-07-28"}, "mcp-name": {"=?base64?zz!?="}}, "tools/call", "toolA", "Mcp-Name is not a decodable sentinel value"},
+		{"modern disagreeing", map[string][]string{"mcp-protocol-version": {"2026-07-28"}, "mcp-name": {"other"}}, "tools/call", "toolA", "Mcp-Name does not match the capability in the request body"},
+		{"sentinel decodes before comparing", map[string][]string{"mcp-protocol-version": {"2026-07-28"}, "mcp-name": {"=?base64?dG9vbF/DvG1sYXV0?="}}, "tools/call", "tool_ümlaut", ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mirroredNameMismatch(policy.NewHeaders(tc.headers), tc.method, tc.capName); got != tc.want {
+				t.Fatalf("mirroredNameMismatch = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A legacy revision mirrors nothing, so there is no header to verify and none to write back.
+func TestOnRequest_LegacyRewriteSetsNoHeader(t *testing.T) {
+	p, params := rewriteToolA(t)
+
+	for _, version := range []string{"", "2025-06-18", "2025-11-25"} {
+		headers := map[string][]string{}
+		if version != "" {
+			headers["mcp-protocol-version"] = []string{version}
+		}
+		ctx := toolCallContext(t, headers)
+
+		mods := mustModifications(t, p.(*McpRewritePolicy).OnRequestBody(context.Background(), ctx, params))
+		updated := mustJSONMap(t, mods.Body)
+		if got := updated["params"].(map[string]any)["name"]; got != "backendTool" {
+			t.Fatalf("version %q: expected rewritten body name 'backendTool', got %v", version, got)
+		}
+		if len(mods.HeadersToSet) != 0 {
+			t.Fatalf("version %q: expected no header rewrite, got %v", version, mods.HeadersToSet)
+		}
+	}
+}
+
+// No rewrite means no stale mirror, so neither half is touched even on a modern request whose
+// header disagrees — the backend's own -32020 check still sees the disagreement it should.
+func TestOnRequest_NoOpRewriteLeavesBothHalvesAlone(t *testing.T) {
+	params := map[string]any{
+		"tools": []any{
+			map[string]any{
+				"name":        "toolA",
+				"description": "desc",
+				"inputSchema": `{"type":"object"}`,
+				"target":      "toolA",
+			},
+		},
+	}
+	p := mustPolicy(t, params)
+	ctx := toolCallContext(t, map[string][]string{
+		"mcp-protocol-version": {"2026-07-28"},
+		"mcp-method":           {"tools/call"},
+		"mcp-name":             {"toolA"},
+	})
+
+	mods := mustModifications(t, p.(*McpRewritePolicy).OnRequestBody(context.Background(), ctx, params))
+	if mods.Body != nil {
+		t.Fatalf("Expected no body rewrite, got %s", string(mods.Body))
+	}
+	if len(mods.HeadersToSet) != 0 {
+		t.Fatalf("Expected no header rewrite, got %v", mods.HeadersToSet)
+	}
+}
+
+// The mirror is checked as soon as the body names a capability, not only when a rewrite would
+// follow, so a self-contradicting request is refused on the same terms as a mismatched method.
+func TestOnRequest_RefusesAMismatchedNameEvenWithNothingToRewrite(t *testing.T) {
+	params := map[string]any{
+		"tools": []any{
+			map[string]any{
+				"name":        "toolA",
+				"description": "desc",
+				"inputSchema": `{"type":"object"}`,
+				"target":      "toolA",
+			},
+		},
+	}
+	p := mustPolicy(t, params)
+	ctx := toolCallContext(t, map[string][]string{
+		"mcp-protocol-version": {"2026-07-28"},
+		"mcp-method":           {"tools/call"},
+		"mcp-name":             {"something_else"},
+	})
+
+	resp := mustImmediateResponse(t, p.(*McpRewritePolicy).OnRequestBody(context.Background(), ctx, params))
+	assertJSONRPCError(t, resp.Body, -32020, "Mcp-Name does not match the capability in the request body")
+}
+
+// A target that is not safely representable as visible ASCII is wrapped before it travels.
+func TestOnRequest_ModernRewriteEncodesANonASCIITarget(t *testing.T) {
+	params := map[string]any{
+		"tools": []any{
+			map[string]any{
+				"name":        "toolA",
+				"description": "desc",
+				"inputSchema": `{"type":"object"}`,
+				"target":      "tool_ümlaut",
+			},
+		},
+	}
+	p := mustPolicy(t, params)
+	ctx := toolCallContext(t, map[string][]string{
+		"mcp-protocol-version": {"2026-07-28"},
+		"mcp-method":           {"tools/call"},
+		"mcp-name":             {"toolA"},
+	})
+
+	mods := mustModifications(t, p.(*McpRewritePolicy).OnRequestBody(context.Background(), ctx, params))
+
+	const wantHeader = "=?base64?dG9vbF/DvG1sYXV0?="
+	if got := mods.HeadersToSet["Mcp-Name"]; got != wantHeader {
+		t.Fatalf("Expected Mcp-Name %q, got %q", wantHeader, got)
+	}
+	// The body carries the real value; only the header is wrapped.
+	updated := mustJSONMap(t, mods.Body)
+	if got := updated["params"].(map[string]any)["name"]; got != "tool_ümlaut" {
+		t.Fatalf("Expected body name 'tool_ümlaut', got %v", got)
+	}
+}
+
+func TestEncodeSentinel_RoundTripsThroughDecode(t *testing.T) {
+	tests := []struct {
+		name       string
+		value      string
+		wantHeader string
+	}{
+		{"plain ascii is left alone", "backendTool", "backendTool"},
+		{"non-ascii is wrapped", "tool_ümlaut", "=?base64?dG9vbF/DvG1sYXV0?="},
+		{"a space is not visible ascii", "two words", "=?base64?dHdvIHdvcmRz?="},
+		{"a newline cannot travel in a header", "a\r\nInjected: yes", "=?base64?YQ0KSW5qZWN0ZWQ6IHllcw==?="},
+		// A literal that would be mistaken for sentinel form must be wrapped, or a reader
+		// would decode it into something the operator never wrote.
+		{"a sentinel-shaped literal is wrapped", "=?base64?dG9vbA==?=", "=?base64?PT9iYXNlNjQ/ZEc5dmJBPT0/PQ==?="},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded := encodeSentinel(tc.value)
+			if encoded != tc.wantHeader {
+				t.Fatalf("encodeSentinel(%q) = %q, want %q", tc.value, encoded, tc.wantHeader)
+			}
+			decoded, err := decodeSentinel(encoded)
+			if err != nil {
+				t.Fatalf("decodeSentinel(%q) returned an error: %v", encoded, err)
+			}
+			if decoded != tc.value {
+				t.Fatalf("round trip of %q produced %q", tc.value, decoded)
+			}
+		})
+	}
+}
+
+// A body the resolver could not read is rejected before any rewrite: the gateway and the server
+// may read those bytes differently, and this policy is about to change them.
+func TestOnRequest_RejectsAnUnusableBody(t *testing.T) {
+	tests := []struct {
+		reason  string
+		code    float64
+		message string
+	}{
+		{"syntax-error", -32700, "Invalid JSON"},
+		{"invalid-member-type", -32600, "Request body has a member of the wrong type"},
+		{"not-an-object", -32600, "Request body is not a single JSON-RPC request object"},
+		{"ambiguous", -32600, "Ambiguous MCP request: body names a member more than once"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.reason, func(t *testing.T) {
+			p, params := rewriteToolA(t)
+			ctx := toolCallContext(t, nil)
+			ctx.SharedContext.ResolutionAttributes = policy.NewResolutionAttributes(map[string]string{
+				"mcp.body.present":  "true",
+				"mcp.body.unusable": tc.reason,
+			})
+
+			resp := mustImmediateResponse(t, p.(*McpRewritePolicy).OnRequestBody(context.Background(), ctx, params))
+			if resp.StatusCode != 400 {
+				t.Fatalf("Expected status 400, got %d", resp.StatusCode)
+			}
+			assertJSONRPCError(t, resp.Body, tc.code, tc.message)
+		})
+	}
+}
+
+// The unusable-body check reads resolver attributes, so it is a no-op on a gateway without a
+// resolver: broken JSON is still rejected by the local parse, exactly as in v1.0.3.
+func TestOnRequest_NoResolverStillRejectsBrokenJSONLocally(t *testing.T) {
+	p, params := rewriteToolA(t)
+	ctx := toolCallContext(t, nil)
+	ctx.Body = &policy.Body{Content: []byte(`{"jsonrpc":"2.0","method":`), Present: true}
+
+	resp := mustImmediateResponse(t, p.(*McpRewritePolicy).OnRequestBody(context.Background(), ctx, params))
+	assertJSONRPCError(t, resp.Body, -32700, "Invalid JSON")
+}
+
+// A resolver-less gateway publishes no attributes, so a well-formed request rewrites normally
+// and the new check changes nothing about the path v1.0.3 took.
+func TestOnRequest_NoResolverRewritesUnchanged(t *testing.T) {
+	p, params := rewriteToolA(t)
+	ctx := toolCallContext(t, nil)
+	if ctx.SharedContext.ResolutionAttributes.Len() != 0 {
+		t.Fatalf("Expected no resolution attributes on a resolver-less route")
+	}
+
+	mods := mustModifications(t, p.(*McpRewritePolicy).OnRequestBody(context.Background(), ctx, params))
+	updated := mustJSONMap(t, mods.Body)
+	if got := updated["params"].(map[string]any)["name"]; got != "backendTool" {
+		t.Fatalf("Expected rewritten name 'backendTool', got %v", got)
+	}
+	if len(mods.HeadersToSet) != 0 {
+		t.Fatalf("Expected no header rewrite without a modern version header, got %v", mods.HeadersToSet)
+	}
+}
+
+// A legacy revision mirrors nothing, so an Mcp-Method header on one of those describes nothing
+// and must not be checked against the body. Pins the era guard on the method check.
+func TestOnRequest_LegacyIgnoresAContradictoryMirroredMethod(t *testing.T) {
+	p, params := rewriteToolA(t)
+
+	for _, version := range []string{"", "2025-06-18", "2025-11-25"} {
+		headers := map[string][]string{"mcp-method": {"tools/list"}}
+		if version != "" {
+			headers["mcp-protocol-version"] = []string{version}
+		}
+		ctx := toolCallContext(t, headers)
+
+		mods := mustModifications(t, p.(*McpRewritePolicy).OnRequestBody(context.Background(), ctx, params))
+		updated := mustJSONMap(t, mods.Body)
+		if got := updated["params"].(map[string]any)["name"]; got != "backendTool" {
+			t.Fatalf("version %q: expected the rewrite to proceed, got %v", version, got)
+		}
+	}
+}
+
+func TestMirroredMethodMismatch(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers map[string][]string
+		method  string
+		want    string
+	}{
+		{"legacy ignores the header entirely", map[string][]string{"mcp-method": {"tools/list"}}, "tools/call", ""},
+		{"modern agreeing", map[string][]string{"mcp-protocol-version": {"2026-07-28"}, "mcp-method": {"tools/call"}}, "tools/call", ""},
+		{"modern absent", map[string][]string{"mcp-protocol-version": {"2026-07-28"}}, "tools/call", "Mcp-Method header is required"},
+		{"modern disagreeing", map[string][]string{"mcp-protocol-version": {"2026-07-28"}, "mcp-method": {"tools/list"}}, "tools/call", "Mcp-Method does not match the method in the request body"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mirroredMethodMismatch(policy.NewHeaders(tc.headers), tc.method); got != tc.want {
+				t.Fatalf("mirroredMethodMismatch = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
