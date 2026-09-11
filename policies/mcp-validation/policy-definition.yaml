@@ -1,0 +1,36 @@
+name: mcp-validation
+version: v0.1.0
+description: |
+  Reject malformed and self-contradictory MCP requests at the gateway, before any other
+  policy acts on them. Applies to POST requests.
+
+  On every MCP request, whichever version it declares, it checks that:
+  - the body parses as JSON;
+  - the body is a single JSON-RPC request object, not a batch and not a bare scalar;
+  - no member the gateway reads is named twice or carries the wrong type;
+  - MCP-Protocol-Version, if present, uses only characters permitted in an HTTP field value.
+
+  On a request declaring MCP 2026-07-28 or later — the first revision to mirror the method
+  and capability name into headers — it additionally checks that:
+  - Mcp-Method is present, and Mcp-Name is present for tools/call, resources/read and
+    prompts/get;
+  - both use only characters permitted in an HTTP field value, verified on the raw value
+    before any Base64 sentinel is decoded;
+  - the protocol version, the method, and the capability name each match the corresponding
+    value in the request body.
+
+  Attach it to any MCP proxy that other MCP policies govern — authentication, authorization,
+  rate limiting or tool access control. On a modern request those policies identify the
+  operation from the mirrored headers, and this policy is what establishes that the headers
+  are telling the truth. If it is not attached ahead of them, those policies act on the
+  mirrored headers alone, with nothing having checked that the headers describe the body the
+  MCP server will actually execute.
+
+parameters:
+  type: object
+  additionalProperties: false
+  properties: {}
+systemParameters:
+  type: object
+  additionalProperties: false
+  properties: {}
