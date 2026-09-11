@@ -1,0 +1,11 @@
+{
+  "name": "mcp-validation",
+  "displayName": "MCP Validation",
+  "version": "0.1",
+  "provider": "WSO2",
+  "categories": [
+    "MCP",
+    "Security"
+  ],
+  "description": "MCP Validation policy validates incoming MCP requests at the gateway: the request body on every request, and the mirrored HTTP headers on requests declaring MCP specification version 2026-07-28 or later.\n\nEvery MCP request has its body checked as well-formed JSON, a single well-formed JSON-RPC request object, and structurally valid MCP — including a member named more than once, which the MCP server may resolve differently than the gateway does. A modern request is additionally checked for the required Mcp-Method and Mcp-Name headers, for characters RFC 9110 permits in a field value, and for agreement between those headers and the body, rejecting a mismatch with error -32020. The policy does not restrict which protocol versions the proxy accepts."
+}

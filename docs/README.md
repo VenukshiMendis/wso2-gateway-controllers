@@ -58,6 +58,7 @@ All available policies, sorted alphabetically.
 | [MCP Authorization](./mcp-authz/v1.2/docs/mcp-authorization.md) | MCP, Security | MCP Authorization policy validates access to MCP resources (tools, resources, prompts) and methods based on JWT claims or OAuth scopes provided by the mcp-auth policy. |
 | [MCP Rate Limit](./mcp-ratelimit/v1.0/docs/mcp-ratelimit.md) | MCP, Security | Applies rate limits to MCP traffic per tool, resource, prompt, or JSON-RPC method. |
 | [MCP Rewrite](./mcp-rewrite/v1.0/docs/mcp-rewrite.md) | MCP | MCP Rewrite policy defines user-facing tools, resources, and prompts and maps them to backend capability names using optional "target" fields. |
+| [MCP Validation](./mcp-validation/v0.1/docs/mcp-validation.md) | MCP, Security | MCP Validation policy validates incoming MCP requests at the gateway: the request body on every request, and the mirrored HTTP headers on requests declaring MCP specification version 2026-07-28 or later. |
 | [Model Round Robin](./model-round-robin/v1.1/docs/model-round-robin.md) | AI | Implements round-robin load balancing for AI models. |
 | [Model Weighted Round Robin](./model-weighted-round-robin/v1.1/docs/model-weighted-round-robin.md) | AI | Implements weighted round-robin load balancing for AI models. |
 | [NeMo Guard Content Safety](./nvidia-nemoguard-content-safety/v0.9/docs/nvidia-nemoguard-content-safety.md) | Guardrails, AI | Validates request and/or response content using NVIDIA NeMo Guard (llama-3.1-nemoguard-8b-content-safety). |
