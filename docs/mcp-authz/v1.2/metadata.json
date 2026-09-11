@@ -1,0 +1,11 @@
+{
+  "name": "mcp-authz",
+  "displayName": "MCP Authorization",
+  "version": "1.2",
+  "provider": "WSO2",
+  "categories": [
+    "MCP",
+    "Security"
+  ],
+  "description": "MCP Authorization governs which MCP capabilities an authenticated identity may invoke, matching scope and claim rules against the tool, resource, prompt or JSON-RPC method a request targets.\n\nIt identifies the capability from the mirrored Mcp-Method and Mcp-Name headers on MCP 2026-07-28, from the gateway's MCP operation resolver on earlier revisions, and by reading the request body itself on a gateway that has no resolver. A capability it cannot identify is not governed; a request body the gateway could not read is rejected."
+}

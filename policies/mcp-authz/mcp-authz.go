@@ -113,6 +113,13 @@ type Attribute struct {
 
 type McpAuthzPolicy struct {
 	Rules []Rule
+
+	// BodyResolved says this route has an MCP operation resolver. The controller injects it
+	// per route; an older one injects nothing and the policy parses the body as before.
+	//
+	// Undeclared in policy-definition.yaml on purpose: operator params are validated before
+	// injection, so a hand-set value is rejected rather than silently stopping enforcement.
+	BodyResolved bool
 }
 
 // deprecationUsage tracks whether the deprecated per-rule fields were used (and whether a new
@@ -146,6 +153,7 @@ func GetPolicy(
 		return nil, fmt.Errorf("failed to parse rules: %w", err)
 	}
 	p.Rules = rules
+	p.BodyResolved = getBoolParam(params, "bodyResolved", false)
 
 	// Deprecation notices (only when a deprecated field is actually in use).
 	if dep.scopesUsed {
@@ -167,6 +175,17 @@ func GetPolicy(
 		"rulesCount", len(p.Rules))
 
 	return p, nil
+}
+
+// getBoolParam reads a boolean parameter, falling back to a default when it is absent or of
+// another type.
+func getBoolParam(params map[string]any, key string, defaultValue bool) bool {
+	if v, ok := params[key]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return defaultValue
 }
 
 // parseRules extracts and validates rules from the 4 top-level arrays: tools, resources, prompts, methods
@@ -420,10 +439,19 @@ func claimConstraintsFromRequired(rc map[string]string) ClaimConstraints {
 	return ClaimConstraints{AllOf: matchers}
 }
 
+// Mode declares what this route needs; both request halves depend on it. A resolver-bearing
+// route decides at the header phase and needs no body; without a resolver it keeps the body
+// and decides there, exactly as earlier versions declared. Only one phase is ever asked for —
+// the executor gates each hook on this policy's own mode, and Mode() is read once at
+// chain-build time, so the controller's parameter decides.
 func (p *McpAuthzPolicy) Mode() policy.ProcessingMode {
+	requestHeader, requestBody := policy.HeaderModeSkip, policy.BodyModeBuffer
+	if p.BodyResolved {
+		requestHeader, requestBody = policy.HeaderModeProcess, policy.BodyModeSkip
+	}
 	return policy.ProcessingMode{
-		RequestHeaderMode:  policy.HeaderModeSkip,
-		RequestBodyMode:    policy.BodyModeBuffer,
+		RequestHeaderMode:  requestHeader,
+		RequestBodyMode:    requestBody,
 		ResponseHeaderMode: policy.HeaderModeSkip,
 		ResponseBodyMode:   policy.BodyModeSkip,
 	}
@@ -440,7 +468,70 @@ func isMcpPath(path string) bool {
 	return cleanPath == "/mcp" || strings.HasPrefix(cleanPath, "/mcp/")
 }
 
+// OnRequestHeaders authorizes a POST /mcp on a route carrying an MCP operation resolver, where
+// the capability arrives without a body. Without a resolver the capability is in the body, which
+// has not arrived at this phase, so that case defers to OnRequestBody.
+func (p *McpAuthzPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.RequestHeaderContext, _ map[string]any) policy.RequestHeaderAction {
+	ds := reqCtx.DownstreamRequest()
+	routePath := ds.Path
+	if reqCtx.SharedContext != nil {
+		routePath = reqCtx.OperationPath
+	}
+	if !strings.EqualFold(ds.Method, "POST") || !isMcpPath(routePath) {
+		slog.Debug("MCP Authorization Policy: Skipping authz...")
+		return nil
+	}
+
+	// Unreachable in production: Mode() declares HeaderModeSkip without a resolver and the
+	// executor gates on that. Kept so a direct call in a test cannot decide without facts.
+	if !p.BodyResolved {
+		return nil
+	}
+
+	// SharedContext is embedded in RequestHeaderContext, so a nil one makes every
+	// reqCtx.Metadata, reqCtx.AuthContext and reqCtx.ResolutionAttributes access panic. A fresh
+	// one carries a zero-value ResolutionAttributes whose Get returns "" — no facts, so the
+	// request is not governed, which is the right outcome for a defensive path.
+	if reqCtx.SharedContext == nil {
+		reqCtx.SharedContext = &policy.SharedContext{}
+	}
+
+	// The resolver could not read the body, so the gateway and the MCP server may read those
+	// bytes differently — a body naming a member twice is valid JSON that a conformant server
+	// accepts and resolves its own way. Governing that on our reading would be governing a
+	// guess, so it is refused, with the same 400 the body-parse path returns for the same bytes.
+	if reason := unusableBodyReason(reqCtx.SharedContext); reason != "" {
+		slog.Debug("MCP Authorization Policy: Rejecting request whose body the resolver could not read",
+			"reason", reason)
+		return p.handleAuthFailure(reqCtx, http.StatusBadRequest, ErrorInvalidRequest, "Invalid MCP request format", nil)
+	}
+
+	facts := mcpFacts(reqCtx.Headers, reqCtx.SharedContext)
+
+	// Skip authorization when the request body is unavailable, or when a modern
+	// MCP request does not include the required Mcp-Method header.
+	if !facts.IsRequestBodyPresent || (facts.IsModernRequest && !facts.HasMethod()) {
+		slog.Debug("MCP Authorization Policy: Skipping authorization because the request body or required Mcp-Method header is unavailable")
+		return nil
+	}
+
+	// An unusable Mcp-Name leaves facts.Name empty, so a rule naming a specific capability
+	// cannot match it and only a wildcard rule governs. That is the same accepted skip as a
+	// request that named no capability at all.
+	if resp := p.govern(reqCtx, facts.Method, facts.Name); resp != nil {
+		return *resp
+	}
+	return nil
+}
+
 func (p *McpAuthzPolicy) OnRequestBody(ctx context.Context, reqCtx *policy.RequestContext, _ map[string]any) policy.RequestAction {
+	// Already decided at the header phase, where the capability arrived without a body.
+	// Unreachable in production: the executor skips this hook for any policy whose own Mode()
+	// declares BodyModeSkip. Kept so a direct call in a test cannot authorize twice.
+	if p.BodyResolved {
+		return nil
+	}
+
 	ds := reqCtx.DownstreamRequest()
 	// Match the MCP route on the immutable OperationPath (the API-definition path),
 	// consistent with the mcp-auth and mcp-acl-list policies. OperationPath is carried
@@ -463,6 +554,10 @@ func (p *McpAuthzPolicy) OnRequestBody(ctx context.Context, reqCtx *policy.Reque
 		reqCtx.SharedContext = &policy.SharedContext{}
 	}
 
+	// One header context, shared with govern and every rejection below. It carries the same
+	// *SharedContext pointer, so metadata govern publishes lands on the real request.
+	headerCtx := headerContextFrom(reqCtx)
+
 	// A body is required to identify the invoked capability; without one there is nothing to authorize.
 	if reqCtx.Body == nil || !reqCtx.Body.Present {
 		slog.Debug("MCP Authorization Policy: No request body present; nothing to authorize")
@@ -473,11 +568,11 @@ func (p *McpAuthzPolicy) OnRequestBody(ctx context.Context, reqCtx *policy.Reque
 	var mcpReq MCPRequest
 	if err := json.Unmarshal(reqCtx.Body.Content, &mcpReq); err != nil {
 		slog.Debug("MCP Authorization Policy: Failed to parse MCP request", "error", err)
-		return p.handleAuthFailure(reqCtx, http.StatusBadRequest, ErrorInvalidRequest, "Invalid MCP request format", nil)
+		return p.handleAuthFailure(headerCtx, http.StatusBadRequest, ErrorInvalidRequest, "Invalid MCP request format", nil)
 	}
 	if err := validateUnambiguousMembers(reqCtx.Body.Content, mcpReq.Method); err != nil {
 		slog.Debug("MCP Authorization Policy: Rejecting MCP request with ambiguous member names", "error", err)
-		return p.handleAuthFailure(reqCtx, http.StatusBadRequest, ErrorInvalidRequest, "Invalid MCP request format", nil)
+		return p.handleAuthFailure(headerCtx, http.StatusBadRequest, ErrorInvalidRequest, "Invalid MCP request format", nil)
 	}
 
 	slog.Debug("MCP Authorization Policy: Extracted MCP attributes",
@@ -485,34 +580,64 @@ func (p *McpAuthzPolicy) OnRequestBody(ctx context.Context, reqCtx *policy.Reque
 		"name", mcpReq.Params.Name,
 		"uri", mcpReq.Params.URI)
 
-	// Determine attribute type from method
-	attributeType, ok := p.getAttributeTypeFromMethod(mcpReq.Method)
+	// The capability is named by params.name for tools and prompts and by params.uri for
+	// resources — the same choice the resolver makes when it publishes capability.name, so both
+	// sources feed govern the same shape.
+	attributeName := p.getAttributeNameFromParams(mcpReq.Method, mcpReq.Params)
+
+	if resp := p.govern(headerCtx, mcpReq.Method, attributeName); resp != nil {
+		return *resp
+	}
+	return nil
+}
+
+// headerContextFrom projects a body-phase context onto the header-phase shape govern and
+// handleAuthFailure take. The *SharedContext pointer is shared, not copied, so metadata and
+// AuthContext changes are visible to the rest of the chain.
+func headerContextFrom(reqCtx *policy.RequestContext) *policy.RequestHeaderContext {
+	ds := reqCtx.DownstreamRequest()
+	return &policy.RequestHeaderContext{
+		SharedContext: reqCtx.SharedContext,
+		Headers:       reqCtx.Headers,
+		Path:          ds.Path,
+		Method:        ds.Method,
+		Authority:     ds.Authority,
+		Scheme:        ds.Scheme,
+		Vhost:         reqCtx.Vhost,
+		Downstream:    reqCtx.Downstream,
+	}
+}
+
+// govern is the authorization decision, from a capability already identified. Both phases run
+// it; only the way they came by method and capabilityName differs.
+//
+// A nil return means the request passes through — either because the method addresses no
+// capability family, or because no rule targets this capability.
+func (p *McpAuthzPolicy) govern(reqCtx *policy.RequestHeaderContext, method, capabilityName string) *policy.ImmediateResponse {
+	attributeType, ok := p.getAttributeTypeFromMethod(method)
 	if !ok {
-		slog.Debug("MCP Authorization Policy: Skipping since the method is not one of tools, resources, or prompts", "method", mcpReq.Method)
+		slog.Debug("MCP Authorization Policy: Skipping since the method is not one of tools, resources, or prompts", "method", method)
 		return nil
 	}
 
-	// Extract attribute name/identifier based on method type
-	attributeName := p.getAttributeNameFromParams(mcpReq.Method, mcpReq.Params)
-
-	// Set MCP metadata in context for other policies. This is published for every parsed MCP
+	// Set MCP metadata in context for other policies. This is published for every identified MCP
 	// capability request, whether or not this policy goes on to govern it.
 	if reqCtx.Metadata == nil {
 		reqCtx.Metadata = make(map[string]any)
 	}
-	reqCtx.Metadata[MetadataMcpMethod] = mcpReq.Method
+	reqCtx.Metadata[MetadataMcpMethod] = method
 	reqCtx.Metadata[MetadataMcpCapabilityType] = attributeType
-	reqCtx.Metadata[MetadataMcpCapabilityName] = attributeName
+	reqCtx.Metadata[MetadataMcpCapabilityName] = capabilityName
 
 	// Rule matching decides governance before any identity is consulted. An invocation that no rule
 	// targets is not governed by this policy and passes through untouched — notably a capability the
 	// MCP authentication policy excluded, which legitimately arrives with no AuthContext at all.
-	matchingRules := p.findMatchingRules(attributeType, attributeName, mcpReq.Method)
+	matchingRules := p.findMatchingRules(attributeType, capabilityName, method)
 	if len(matchingRules) == 0 {
 		slog.Debug("MCP Authorization Policy: No matching rules; invocation is not governed by this policy",
 			"attributeType", attributeType,
-			"attributeName", attributeName,
-			"method", mcpReq.Method)
+			"attributeName", capabilityName,
+			"method", method)
 		return nil
 	}
 
@@ -522,17 +647,19 @@ func (p *McpAuthzPolicy) OnRequestBody(ctx context.Context, reqCtx *policy.Reque
 	if authCtx == nil || !authCtx.Authenticated {
 		slog.Debug("MCP Authorization Policy: No authenticated context found for a governed capability",
 			"attributeType", attributeType,
-			"attributeName", attributeName)
-		return p.handleAuthFailure(reqCtx, http.StatusUnauthorized, ErrorInvalidToken, "Unauthorized: authentication required for this MCP capability", nil)
+			"attributeName", capabilityName)
+		resp := p.handleAuthFailure(reqCtx, http.StatusUnauthorized, ErrorInvalidToken, "Unauthorized: authentication required for this MCP capability", nil)
+		return &resp
 	}
 
 	// Check authorization rules
-	authorized, missingScopes := p.evaluateRules(matchingRules, attributeType, attributeName, authCtx)
+	authorized, missingScopes := p.evaluateRules(matchingRules, attributeType, capabilityName, authCtx)
 	if !authorized {
 		slog.Debug("MCP Authorization Policy: Authorization check failed",
-			"attributeName", mcpReq.Params.Name,
-			"method", mcpReq.Method)
-		return p.handleAuthFailure(reqCtx, http.StatusForbidden, ErrorInsufficientScope, "Forbidden: insufficient permissions to access this MCP resource", missingScopes)
+			"attributeName", capabilityName,
+			"method", method)
+		resp := p.handleAuthFailure(reqCtx, http.StatusForbidden, ErrorInsufficientScope, "Forbidden: insufficient permissions to access this MCP resource", missingScopes)
+		return &resp
 	}
 
 	slog.Debug("MCP Authorization Policy: Authorization check passed")
@@ -543,7 +670,10 @@ func (p *McpAuthzPolicy) OnRequestBody(ctx context.Context, reqCtx *policy.Reque
 	return nil
 }
 
-func (p *McpAuthzPolicy) handleAuthFailure(reqCtx *policy.RequestContext, statusCode int, errorCode, errorMessage string, scopeMap map[string]struct{}) policy.RequestAction {
+// handleAuthFailure builds the rejection. It takes a header context and returns the concrete
+// ImmediateResponse, which satisfies both RequestHeaderAction and RequestAction — so the same
+// builder serves whichever phase decided.
+func (p *McpAuthzPolicy) handleAuthFailure(reqCtx *policy.RequestHeaderContext, statusCode int, errorCode, errorMessage string, scopeMap map[string]struct{}) policy.ImmediateResponse {
 	slog.Debug("MCP Authorization Policy: handleAuthFailure called",
 		"errorMessage", errorMessage,
 	)
